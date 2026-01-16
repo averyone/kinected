@@ -6,6 +6,8 @@ import (
 
 	"github.com/google/uuid"
 	plaidgo "github.com/plaid/plaid-go/v29/plaid"
+
+	"github.com/kinected/kinected/plaid/audit"
 )
 
 // SyncAccounts fetches and updates account information for an item.
@@ -25,10 +27,29 @@ func (c *Client) SyncAccounts(ctx context.Context, itemID uuid.UUID) ([]*Account
 
 // syncAccounts is an internal method that syncs accounts with a pre-decrypted token.
 func (c *Client) syncAccounts(ctx context.Context, item *Item, accessToken string) ([]*Account, error) {
+	// Set up call context for audit logging
+	cc := newCallContext(audit.OpAccountsGet).
+		withUserID(item.UserID).
+		withItemID(item.ID)
+
 	req := plaidgo.NewAccountsGetRequest(accessToken)
-	resp, _, err := c.plaid.PlaidApi.AccountsGet(ctx).AccountsGetRequest(*req).Execute()
+	var resp plaidgo.AccountsGetResponse
+	var requestID string
+
+	err := c.api.call(ctx, cc, func() error {
+		var callErr error
+		resp, _, callErr = c.plaid.PlaidApi.AccountsGet(ctx).AccountsGetRequest(*req).Execute()
+		if callErr != nil {
+			return handlePlaidError(callErr, ctx)
+		}
+		requestID = resp.GetRequestId()
+		return nil
+	}, func() string {
+		return requestID
+	})
+
 	if err != nil {
-		return nil, handlePlaidError(err, ctx)
+		return nil, err
 	}
 
 	accounts := make([]*Account, 0, len(resp.GetAccounts()))
@@ -71,11 +92,29 @@ func (c *Client) SyncBalances(ctx context.Context, itemID uuid.UUID) ([]*Account
 		return nil, err
 	}
 
-	// Use accounts/balance/get for real-time balances
+	// Set up call context for audit logging
+	cc := newCallContext(audit.OpAccountsBalanceGet).
+		withUserID(item.UserID).
+		withItemID(itemID)
+
 	req := plaidgo.NewAccountsBalanceGetRequest(accessToken)
-	resp, _, err := c.plaid.PlaidApi.AccountsBalanceGet(ctx).AccountsBalanceGetRequest(*req).Execute()
+	var resp plaidgo.AccountsGetResponse
+	var requestID string
+
+	err = c.api.call(ctx, cc, func() error {
+		var callErr error
+		resp, _, callErr = c.plaid.PlaidApi.AccountsBalanceGet(ctx).AccountsBalanceGetRequest(*req).Execute()
+		if callErr != nil {
+			return handlePlaidError(callErr, ctx)
+		}
+		requestID = resp.GetRequestId()
+		return nil
+	}, func() string {
+		return requestID
+	})
+
 	if err != nil {
-		return nil, handlePlaidError(err, ctx)
+		return nil, err
 	}
 
 	accounts := make([]*Account, 0, len(resp.GetAccounts()))

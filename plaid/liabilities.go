@@ -6,6 +6,8 @@ import (
 
 	"github.com/google/uuid"
 	plaidgo "github.com/plaid/plaid-go/v29/plaid"
+
+	"github.com/kinected/kinected/plaid/audit"
 )
 
 // SyncLiabilities fetches and updates liability information for an item.
@@ -36,10 +38,29 @@ func (c *Client) syncLiabilities(ctx context.Context, item *Item, accessToken st
 		accountMap[acc.PlaidAccountID] = acc
 	}
 
+	// Set up call context for audit logging
+	cc := newCallContext(audit.OpLiabilitiesGet).
+		withUserID(item.UserID).
+		withItemID(item.ID)
+
 	req := plaidgo.NewLiabilitiesGetRequest(accessToken)
-	resp, _, err := c.plaid.PlaidApi.LiabilitiesGet(ctx).LiabilitiesGetRequest(*req).Execute()
+	var resp plaidgo.LiabilitiesGetResponse
+	var requestID string
+
+	err = c.api.call(ctx, cc, func() error {
+		var callErr error
+		resp, _, callErr = c.plaid.PlaidApi.LiabilitiesGet(ctx).LiabilitiesGetRequest(*req).Execute()
+		if callErr != nil {
+			return handlePlaidError(callErr, ctx)
+		}
+		requestID = resp.GetRequestId()
+		return nil
+	}, func() string {
+		return requestID
+	})
+
 	if err != nil {
-		return nil, handlePlaidError(err, ctx)
+		return nil, err
 	}
 
 	var allLiabilities []*Liability

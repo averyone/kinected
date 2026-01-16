@@ -2,22 +2,49 @@ package plaid
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 
 	plaidgo "github.com/plaid/plaid-go/v29/plaid"
 
+	"github.com/kinected/kinected/plaid/audit"
 	"github.com/kinected/kinected/plaid/storage"
 )
 
 // Client provides methods for interacting with Plaid and managing financial data.
 type Client struct {
-	config  *Config
-	plaid   *plaidgo.APIClient
-	storage storage.Storage
+	config      *Config
+	plaid       *plaidgo.APIClient
+	storage     storage.Storage
+	auditLogger audit.Logger
+	api         *apiCaller
+}
+
+// ClientOption is a functional option for configuring the client.
+type ClientOption func(*Client) error
+
+// WithAuditLogger sets a custom audit logger for the client.
+func WithAuditLogger(logger audit.Logger) ClientOption {
+	return func(c *Client) error {
+		c.auditLogger = logger
+		return nil
+	}
+}
+
+// WithDatabase sets up SQLite audit logging using the provided database.
+func WithDatabase(db *sql.DB) ClientOption {
+	return func(c *Client) error {
+		logger, err := audit.NewSQLiteLogger(db)
+		if err != nil {
+			return fmt.Errorf("failed to create audit logger: %w", err)
+		}
+		c.auditLogger = logger
+		return nil
+	}
 }
 
 // NewClient creates a new Plaid client with the given configuration and storage.
-func NewClient(cfg Config, store storage.Storage) (*Client, error) {
+func NewClient(cfg Config, store storage.Storage, opts ...ClientOption) (*Client, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
@@ -30,17 +57,41 @@ func NewClient(cfg Config, store storage.Storage) (*Client, error) {
 
 	apiClient := plaidgo.NewAPIClient(plaidConfig)
 
-	return &Client{
-		config:  &cfg,
-		plaid:   apiClient,
-		storage: store,
-	}, nil
+	client := &Client{
+		config:      &cfg,
+		plaid:       apiClient,
+		storage:     store,
+		auditLogger: audit.NopLogger{}, // Default to no-op logger
+	}
+
+	// Apply options
+	for _, opt := range opts {
+		if err := opt(client); err != nil {
+			return nil, err
+		}
+	}
+
+	// Set up retry config
+	retryConfig := DefaultRetryConfig()
+	if cfg.RetryConfig != nil {
+		retryConfig = *cfg.RetryConfig
+	}
+
+	// Create API caller with retry and audit support
+	client.api = newAPICaller(client, retryConfig, client.auditLogger)
+
+	return client, nil
 }
 
 // Storage returns the underlying storage implementation.
 // This can be used for direct database access if needed.
 func (c *Client) Storage() storage.Storage {
 	return c.storage
+}
+
+// AuditLogger returns the audit logger.
+func (c *Client) AuditLogger() audit.Logger {
+	return c.auditLogger
 }
 
 // Close releases resources held by the client.

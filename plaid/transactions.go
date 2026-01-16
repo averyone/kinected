@@ -6,6 +6,8 @@ import (
 
 	"github.com/google/uuid"
 	plaidgo "github.com/plaid/plaid-go/v29/plaid"
+
+	"github.com/kinected/kinected/plaid/audit"
 )
 
 // SyncTransactions fetches transactions for an item within the specified date range.
@@ -47,15 +49,37 @@ func (c *Client) syncTransactions(ctx context.Context, item *Item, accessToken s
 	count := int32(500)
 
 	for {
+		// Set up call context for audit logging (one per page)
+		cc := newCallContext(audit.OpTransactionsGet).
+			withUserID(item.UserID).
+			withItemID(item.ID).
+			withMetadata("start_date", startDate).
+			withMetadata("end_date", endDate).
+			withMetadata("offset", offset)
+
 		req := plaidgo.NewTransactionsGetRequest(accessToken, startDate, endDate)
 		req.SetOptions(plaidgo.TransactionsGetRequestOptions{
 			Offset: &offset,
 			Count:  &count,
 		})
 
-		resp, _, err := c.plaid.PlaidApi.TransactionsGet(ctx).TransactionsGetRequest(*req).Execute()
+		var resp plaidgo.TransactionsGetResponse
+		var requestID string
+
+		err := c.api.call(ctx, cc, func() error {
+			var callErr error
+			resp, _, callErr = c.plaid.PlaidApi.TransactionsGet(ctx).TransactionsGetRequest(*req).Execute()
+			if callErr != nil {
+				return handlePlaidError(callErr, ctx)
+			}
+			requestID = resp.GetRequestId()
+			return nil
+		}, func() string {
+			return requestID
+		})
+
 		if err != nil {
-			return nil, handlePlaidError(err, ctx)
+			return nil, err
 		}
 
 		// Process transactions

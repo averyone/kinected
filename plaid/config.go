@@ -49,6 +49,14 @@ type Config struct {
 
 	// RedirectURI is required for OAuth institutions.
 	RedirectURI string
+
+	// RetryConfig configures retry behavior for API calls.
+	// If not set, defaults to DefaultRetryConfig().
+	RetryConfig *RetryConfig
+
+	// EnableAuditLog enables database-driven audit logging of API calls.
+	// Default is true.
+	EnableAuditLog *bool
 }
 
 // Validate checks that the configuration is valid.
