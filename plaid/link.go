@@ -6,6 +6,8 @@ import (
 
 	"github.com/google/uuid"
 	plaidgo "github.com/plaid/plaid-go/v29/plaid"
+
+	"github.com/kinected/kinected/plaid/audit"
 )
 
 // CreateLinkToken creates a Plaid Link token for initiating the Link flow.
@@ -47,9 +49,28 @@ func (c *Client) CreateLinkToken(ctx context.Context, req LinkTokenRequest) (*Li
 		linkReq.SetRedirectUri(c.config.RedirectURI)
 	}
 
-	resp, _, err := c.plaid.PlaidApi.LinkTokenCreate(ctx).LinkTokenCreateRequest(*linkReq).Execute()
+	// Set up call context for audit logging
+	cc := newCallContext(audit.OpLinkTokenCreate).
+		withUserID(req.UserID).
+		withMetadata("products", products)
+
+	var resp plaidgo.LinkTokenCreateResponse
+	var requestID string
+
+	err := c.api.call(ctx, cc, func() error {
+		var callErr error
+		resp, _, callErr = c.plaid.PlaidApi.LinkTokenCreate(ctx).LinkTokenCreateRequest(*linkReq).Execute()
+		if callErr != nil {
+			return handlePlaidError(callErr, ctx)
+		}
+		requestID = resp.GetRequestId()
+		return nil
+	}, func() string {
+		return requestID
+	})
+
 	if err != nil {
-		return nil, handlePlaidError(err, ctx)
+		return nil, err
 	}
 
 	return &LinkTokenResponse{
@@ -62,15 +83,34 @@ func (c *Client) CreateLinkToken(ctx context.Context, req LinkTokenRequest) (*Li
 // ExchangePublicToken exchanges a public token from Link for an access token,
 // creates an Item record, and fetches initial account information.
 func (c *Client) ExchangePublicToken(ctx context.Context, req ExchangeTokenRequest) (*Item, error) {
-	// Exchange public token for access token
-	exchangeReq := plaidgo.NewItemPublicTokenExchangeRequest(req.PublicToken)
-	resp, _, err := c.plaid.PlaidApi.ItemPublicTokenExchange(ctx).ItemPublicTokenExchangeRequest(*exchangeReq).Execute()
-	if err != nil {
-		return nil, handlePlaidError(err, ctx)
-	}
+	// Set up call context for audit logging
+	cc := newCallContext(audit.OpPublicTokenExchange).
+		withUserID(req.UserID).
+		withMetadata("institution_id", req.InstitutionID).
+		withMetadata("institution_name", req.InstitutionName)
 
-	accessToken := resp.GetAccessToken()
-	plaidItemID := resp.GetItemId()
+	exchangeReq := plaidgo.NewItemPublicTokenExchangeRequest(req.PublicToken)
+
+	var accessToken string
+	var plaidItemID string
+	var requestID string
+
+	err := c.api.call(ctx, cc, func() error {
+		resp, _, callErr := c.plaid.PlaidApi.ItemPublicTokenExchange(ctx).ItemPublicTokenExchangeRequest(*exchangeReq).Execute()
+		if callErr != nil {
+			return handlePlaidError(callErr, ctx)
+		}
+		accessToken = resp.GetAccessToken()
+		plaidItemID = resp.GetItemId()
+		requestID = resp.GetRequestId()
+		return nil
+	}, func() string {
+		return requestID
+	})
+
+	if err != nil {
+		return nil, err
+	}
 
 	// Encrypt the access token
 	encryptedToken, err := c.encryptAccessToken(accessToken)
@@ -135,13 +175,25 @@ func (c *Client) RemoveItem(ctx context.Context, itemID uuid.UUID) error {
 		return err
 	}
 
-	// Remove from Plaid
+	// Set up call context for audit logging
+	cc := newCallContext(audit.OpItemRemove).
+		withUserID(item.UserID).
+		withItemID(itemID)
+
 	removeReq := plaidgo.NewItemRemoveRequest(accessToken)
-	_, _, err = c.plaid.PlaidApi.ItemRemove(ctx).ItemRemoveRequest(*removeReq).Execute()
-	if err != nil {
-		// Continue with local deletion even if Plaid fails
-		// (item might already be removed on Plaid's side)
-	}
+	var requestID string
+
+	// Try to remove from Plaid (continue even if it fails)
+	_ = c.api.call(ctx, cc, func() error {
+		resp, _, callErr := c.plaid.PlaidApi.ItemRemove(ctx).ItemRemoveRequest(*removeReq).Execute()
+		if callErr != nil {
+			return handlePlaidError(callErr, ctx)
+		}
+		requestID = resp.GetRequestId()
+		return nil
+	}, func() string {
+		return requestID
+	})
 
 	// Delete from local storage (cascades to accounts, transactions, etc.)
 	return c.storage.DeleteItem(ctx, itemID)
@@ -169,20 +221,37 @@ func (c *Client) RefreshItemStatus(ctx context.Context, itemID uuid.UUID) (*Item
 		return nil, err
 	}
 
-	// Get item status from Plaid
+	// Set up call context for audit logging
+	cc := newCallContext(audit.OpItemGet).
+		withUserID(item.UserID).
+		withItemID(itemID)
+
 	getReq := plaidgo.NewItemGetRequest(accessToken)
-	resp, _, err := c.plaid.PlaidApi.ItemGet(ctx).ItemGetRequest(*getReq).Execute()
+	var resp plaidgo.ItemGetResponse
+	var requestID string
+
+	err = c.api.call(ctx, cc, func() error {
+		var callErr error
+		resp, _, callErr = c.plaid.PlaidApi.ItemGet(ctx).ItemGetRequest(*getReq).Execute()
+		if callErr != nil {
+			return handlePlaidError(callErr, ctx)
+		}
+		requestID = resp.GetRequestId()
+		return nil
+	}, func() string {
+		return requestID
+	})
+
 	if err != nil {
-		plaidErr := handlePlaidError(err, ctx)
-		if pe, ok := plaidErr.(*PlaidError); ok && pe.NeedsReauthentication() {
+		if pe, ok := err.(*PlaidError); ok && pe.NeedsReauthentication() {
 			// Update item status to reflect auth issue
 			c.storage.UpdateItemStatus(ctx, itemID, ItemStatusLoginRequired, pe.ErrorCode, pe.ErrorMessage)
 			item.Status = ItemStatusLoginRequired
 			item.ErrorCode = pe.ErrorCode
 			item.ErrorMessage = pe.ErrorMessage
-			return item, plaidErr
+			return item, err
 		}
-		return nil, plaidErr
+		return nil, err
 	}
 
 	// Update item status based on response
